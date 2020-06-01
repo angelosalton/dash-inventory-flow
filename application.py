@@ -26,8 +26,17 @@ from flask import Flask
 server = Flask(__name__)
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SANDSTONE])
 
+# generate map
+# boundaries - center Porto Alegre
+# north, south, east, west = -30.0259, -30.0801, -51.1469, -51.2371
+
+# mesh = osmnx.graph_from_bbox(north, south, east, west, network_type='drive')
+# pickle.dump(mesh, open('map.pkl', 'wb'))
+
 # load map
-net = pickle.load(open('map.pkl', 'rb'))
+mesh = pickle.load(open('map.pkl', 'rb'))
+mesh_nodes = [*mesh.nodes()]
+mesh_edges = [*mesh.edges(data=True)]
 
 # layout
 navbar = dbc.Navbar([
@@ -35,9 +44,9 @@ navbar = dbc.Navbar([
         dbc.NavbarBrand('dash-optim', className='ml-2'),
         html.A([
             html.Img(
-                src='https://img.shields.io/github/forks/angelosalton/dash-optim?style=social', height='20px')
+                src='https://img.shields.io/github/forks/angelosalton/dash-inventory-flow?style=social', height='20px')
         ],
-            href='https://github.com/angelosalton/dash-optim/fork')
+            href='https://github.com/angelosalton/dash-inventory-flow/fork')
     ],
         align='center',
         no_gutters=True)
@@ -46,16 +55,12 @@ navbar = dbc.Navbar([
     dark=True
 )
 
-sidebar = dbc.Card([
+parameters = dbc.Row([
     html.H4('Simulation parameters'),
     # location
     html.P('Locations', style={'margin-bottom': '0px'}),
     dbc.Input(id='input-locations', type='number', min=2,
               max=20, value=4, style={'margin-bottom': '20px'}),
-    # item
-    html.P('Items', style={'margin-bottom': '0px'}),
-    dbc.Input(id='input-items', type='number', min=1, max=5,
-              value=3, style={'margin-bottom': '20px'}),
     # run
     dbc.Button('Update', id='btn-update')
 ], style={'padding': '2em 2em'})
@@ -71,10 +76,10 @@ app.layout = dbc.Container([
         dcc.Markdown('''
         Welcome! This is a simulation of the multicommodity flow problem: there are a number of locations/warehouses with supply and demand of a number of non-substitutible goods. A solution for the problem is a program of transfers that minimize excess supply/demand of each item.
         '''),
-        # sidebar
+        # parameters
         dbc.Col([
             dbc.Row([
-                sidebar
+                parameters
             ])
         ], md=2),
         # main
@@ -84,9 +89,7 @@ app.layout = dbc.Container([
             ]),
             dbc.Row([
                 dbc.Col([
-                    dcc.Markdown('#### Solution'),
-                    html.P('Item to display', style={'margin-bottom': '0px'}),
-                    dcc.Dropdown(id='item-drop-div'),
+                    dcc.Markdown('#### Map'),
                     html.Div(id='plot-solution')
                 ]),
                 dbc.Col([
@@ -125,21 +128,25 @@ def fig_to_uri(in_fig: mpl.figure.Figure, close_all=True, **save_args) -> str:
     Output('data-store', 'data'),
     [Input('btn-update', 'n_clicks')],
     [State('input-locations', 'value'),
-     State('input-items', 'value'),
      State('data-store', 'data')])
-def dataset_gen(n_clicks, locations, items, df):
+def dataset_gen(clicks, n_nodes, df_json):
     '''
-    Generate dataset for dash-logit.
+    Generate dataset for dash-optim.
     '''
     df = pd.DataFrame()
+    
+    # get random nodes
+    rnodes = random.choices(mesh_nodes, k=n_nodes)
 
-    df['location'] = [chr(x) for x in range(65, 65+locations)]*items
-    df['item'] = sorted([*range(1, items+1)]*locations)
-    df['supply'] = random.sample(range(0, 200, 10), locations*items)
-    df['demand'] = random.sample(range(0, 200, 10), locations*items)
+    df['location'] = rnodes
+    df['supply'] = random.sample(range(0, 200, 10), n_nodes)
+    df['demand'] = random.sample(range(0, 200, 10), n_nodes)
     df['net_demand'] = df['demand'] - df['supply']
+    
+    dfr = df.append(dummy_node, ignore_index=True)
 
-    return df.to_json(orient='records')
+    return dfr.to_json(orient='records')
+
 
 @app.callback(
     Output('data-table', 'children'),
@@ -166,125 +173,94 @@ def print_datatable(ts, clicks, df_json):
         }
     )
 
-
-# item dropdown
-@app.callback(
-    Output('item-drop-div', 'options'),
-    [Input('data-store', 'data')])
-def update_dropdown(df_json):
-
-    if df_json is None:
-        raise PreventUpdate
-
-    df = pd.read_json(df_json, orient='records')
-    opts = [{'label': str(i), 'value': i}
-            for i in df['item'].unique().tolist()]
-
-    return opts
-
-
 # call network generator
 @app.callback(
     Output('plot-solution', 'children'),
-    [Input('btn-update', 'n_clicks'),
-     Input('item-drop-div', 'value')],
-    [State('data-store', 'data'),
-     State('distance-store', 'data')])
-def network_gen(clicks, item, df_json, distances):
+    [Input('btn-update', 'n_clicks')],
+    [State('data-store', 'data')])
+def model_solution(clicks, df_json):
     '''
-    Generates a networkx graph from data.
+    Outputs the solution of model.
     '''
-    if df_json is None or distances is None:
+    if df_json is None:
         raise PreventUpdate
 
-    # subset data
-    df = pd.read_json(df_json, orient='records')
+    dff = pd.read_json(df_json, orient='records')
 
-    list_items = df['item'].unique().tolist()
+    # get number of nodes from data
+    n_nodes = dff['location'].unique().count()
 
-    try:
-        dft = df[df['item'] == list_items[item-1]]
-    except:
-        raise PreventUpdate
+    # get the randomized nodes
+    rnodes = dff['location'].tolist()
+
+    # calculate shortest paths
+    paths = {i: {j: nx.shortest_path(mesh, i, j, weight='length') for j in nodelist} for i in nodelist}
+
+    def simplified_graph(graph, nodelist, pathlist):
+        '''
+        Return a simplified graph from OSMnx with shortest distances.
+        '''
+        def calc_distance(graph, path):
+            '''
+            Get total distance of a path in the network.
+            '''
+            dist = round(sum(ox.utils_graph.get_route_edge_attributes(graph, path, 'length'))/1000., 2)
+            return dist
+        
+        distances = {i: {j: calc_distance(graph, pathlist[i][j]) for j in nodelist} for i in nodelist}
+
+        # create simplified graph
+        subgraph = nx.DiGraph()
+        
+        # add nodes
+        [subgraph.add_node(n) for n in nodelist]
+
+        # add edges
+        [subgraph.add_edge(i, j, weight=distances[i][j]) for (i,j) in permutations(nodelist,2)]
+        
+        return subgraph
+
+    # get random nodes
+    rnodes = random.choices(mesh_nodes, k=n_nodes)
+    
+    # create simplified graph
+    sgraph = simplified_graph(mesh, rnodes, paths)
 
     # calculate excess supply/demand
-    exc_dem = dft['net_demand'].sum() if dft['net_demand'].sum(
-    ) < 0 else -dft['net_demand'].sum()
+    exc_dem = df['net_demand'].sum()
 
     # add dummy node
-    dummy_node = {
-        'location': 'dummy',
-        'item': item,
-        'supply': 0 if exc_dem > 0 else exc_dem,
-        'demand': exc_dem if exc_dem > 0 else 0,
-        'net_demand': -exc_dem if exc_dem > 0 else exc_dem,
-    }
+    sgraph.add_node('dummy')
+    [sgraph.add_edge('dummy', n, length=0.1) for n in rnodes]
 
-    dft = dft.append(dummy_node, ignore_index=True)
-    dft.fillna(0, inplace=True)
+    # adding demand
+    [sgraph.add_node(n, demand=int(dftest[dftest['location']==n]['net_demand'])) for n in rnodes]
+    sgraph.add_node('dummy', demand=-exc_dem)
 
-    # move data to dict
-    records = dft[['location', 'net_demand']].to_dict('records')
-
-    # create graph
-    Gr = nx.DiGraph()
-
-    # get unique locations
-    locs = dft['location'].unique()
-
-    # add nodes
-    [Gr.add_node(item['location'], demand=item['net_demand'])
-        for item in records]
-
-    # edge weights
-    node_weights = distances #{j: {i: 1 for i in locs} for j in locs}
-
-    # add edges
-    [Gr.add_edge(i, j, weight=1, capacity=100)
-        for (i, j) in permutations(locs, 2)]
-
-    def graph_gen(gr=Gr):
-        '''
-        Calculate and plot optimal flows.
-
-        :param gr: A networkx network.
-        :returns: None
-        '''
-        try:
-            _, flows = nx.network_simplex(gr)
-        except nx.NetworkXUnfeasible:
-            return html.Div([
-                dcc.Markdown('### No feasible solution.')
-            ])
-
-        # drawing
-        visible_edges = [(i, j)
-                         for i, j in gr.edges if flows[i][j] > 0 and i != 'dummy']
-        visible_nodes = [i for i in gr.nodes if i != 'dummy']
-        visible_edgelabels = {(i[0], i[1]): flows[i[0]][i[1]]
-                              for i in visible_edges}
-
-        # set layout
-        gr_layout = nx.layout.circular_layout(gr)
-
-        fig1, ax1 = plt.subplots()
-        nx.draw_networkx_nodes(
-            gr, pos=gr_layout, nodelist=visible_nodes, node_size=1000, alpha=.9, ax=ax1, node_shape='^')
-        nx.draw_networkx_labels(gr, pos=gr_layout, ax=ax1)
-        nx.draw_networkx_edges(
-            gr, pos=gr_layout, edgelist=visible_edges, min_target_margin=40, ax=ax1)
-        nx.draw_networkx_edge_labels(
-            gr, pos=gr_layout, edge_labels=visible_edgelabels, font_size=20, ax=ax1)
-
-        layout = html.Div([
-            html.Img(src=fig_to_uri(fig1), style={'max-width': '400px'})
+    try:
+        _, flows = nx.network_simplex(sgraph)
+    except nx.NetworkXUnfeasible:
+        return html.Div([
+            dcc.Markdown('Solution not found.')
         ])
 
-        return layout
+    # nodes positions
+    rnodes_attr = {n: mesh.nodes[n] for n in rnodes}
 
-    # plot the graph
-    return graph_gen()
+    # initialize figure
+    fig = ox.plot_route_folium(mesh, paths[rnodes[0]][rnodes[4]], popup_attribute='name', route_opacity=.7)
 
+    # add nodes
+    [ox.folium.folium.Marker([rnodes_attr[n]['y'], rnodes_attr[n]['x']], tooltip=str(n)).add_to(fig) for n in rnodes]
+
+    # add routes
+    ox.plot_route_folium(mesh, paths[rnodes[0]][rnodes[3]], route_map=fig, popup_attribute='name', route_opacity=.7)
+
+    # show figure
+    return html.Div([
+        dcc.Markdown('Ok!')
+    ])
+    
 
 if __name__ == "__main__":
     app.run_server(debug=True)
