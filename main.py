@@ -23,8 +23,8 @@ from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 from flask import Flask
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SANDSTONE])
-application = app.server
+dash_app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SANDSTONE])
+app = dash_app.server
 
 # generate map
 # boundaries - center Porto Alegre
@@ -69,7 +69,7 @@ parameters = dbc.Row([
     dbc.Button('Update', id='btn-update')
 ], style={'padding': '2em 2em'})
 
-app.layout = dbc.Container([
+dash_app.layout = dbc.Container([
     navbar,
     # data stores
     dcc.Store(id='data-store', storage_type='session'),
@@ -127,7 +127,7 @@ def fig_to_uri(in_fig: mpl.figure.Figure, close_all=True, **save_args) -> str:
 
 
 # Callbacks
-@app.callback(
+@dash_app.callback(
     Output('data-store', 'data'),
     [Input('btn-update', 'n_clicks')],
     [State('input-locations', 'value'),
@@ -149,7 +149,7 @@ def dataset_gen(clicks, n_nodes, df_json):
     return df.to_json(orient='records')
 
 
-@app.callback(
+@dash_app.callback(
     Output('data-table', 'children'),
     [Input('data-store', 'modified_timestamp'),
      Input('btn-update', 'n_clicks')],
@@ -177,7 +177,7 @@ def print_datatable(ts, clicks, df_json):
 # call network generator
 
 
-@app.callback(
+@dash_app.callback(
     Output('plot-solution', 'children'),
     [Input('btn-update', 'n_clicks')],
     [State('data-store', 'data')])
@@ -287,4 +287,4 @@ def model_solution(clicks, df_json):
 
 
 if __name__ == "__main__":
-    app.run_server(debug=True)
+    dash_app.run_server(host='0.0.0.0', port=8080)
