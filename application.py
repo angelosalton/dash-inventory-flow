@@ -23,8 +23,8 @@ from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 from flask import Flask
 
-server = Flask(__name__)
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SANDSTONE])
+application = app.server
 
 # generate map
 # boundaries - center Porto Alegre
@@ -41,7 +41,7 @@ mesh_edges = [*mesh.edges(data=True)]
 # layout
 navbar = dbc.Navbar([
     dbc.Row([
-        dbc.NavbarBrand('dash-optim', className='ml-2'),
+        dbc.NavbarBrand('dash-inventory-flow', className='ml-2'),
         html.A([
             html.Img(
                 src='https://img.shields.io/github/forks/angelosalton/dash-inventory-flow?style=social', height='20px')
@@ -61,6 +61,10 @@ parameters = dbc.Row([
     html.P('Locations', style={'margin-bottom': '0px'}),
     dbc.Input(id='input-locations', type='number', min=2,
               max=20, value=4, style={'margin-bottom': '20px'}),
+    # cost
+    html.P('Cost/km of moving a unit of good', style={'margin-bottom': '0px'}),
+    dbc.Input(id='input-cost', type='number', min=0.1,
+              max=10, value=1, step=0.01, style={'margin-bottom': '20px'}),
     # run
     dbc.Button('Update', id='btn-update')
 ], style={'padding': '2em 2em'})
@@ -84,17 +88,16 @@ app.layout = dbc.Container([
         ], md=2),
         # main
         dbc.Col([
-            dbc.Row([
-                dcc.Markdown('### Hello!')
-            ]),
-            dbc.Row([
-                dbc.Col([
-                    dcc.Markdown('#### Map'),
-                    html.Div(id='plot-solution')
-                ]),
-                dbc.Col([
-                    dcc.Markdown('#### Data'),
-                    html.Div(id='data-table')
+            dcc.Loading([
+                dbc.Row([
+                    dbc.Col([
+                        dcc.Markdown('#### Map'),
+                        html.Div(id='plot-solution')
+                    ]),
+                    dbc.Col([
+                        dcc.Markdown('#### Data'),
+                        html.Div(id='data-table')
+                    ])
                 ])
             ])
         ], md=10, style={'padding-left': '30px'})
@@ -134,7 +137,7 @@ def dataset_gen(clicks, n_nodes, df_json):
     Generate dataset for dash-optim.
     '''
     df = pd.DataFrame()
-    
+
     # get random nodes
     rnodes = random.choices(mesh_nodes, k=n_nodes)
 
@@ -142,10 +145,8 @@ def dataset_gen(clicks, n_nodes, df_json):
     df['supply'] = random.sample(range(0, 200, 10), n_nodes)
     df['demand'] = random.sample(range(0, 200, 10), n_nodes)
     df['net_demand'] = df['demand'] - df['supply']
-    
-    dfr = df.append(dummy_node, ignore_index=True)
 
-    return dfr.to_json(orient='records')
+    return df.to_json(orient='records')
 
 
 @app.callback(
@@ -174,6 +175,8 @@ def print_datatable(ts, clicks, df_json):
     )
 
 # call network generator
+
+
 @app.callback(
     Output('plot-solution', 'children'),
     [Input('btn-update', 'n_clicks')],
@@ -187,14 +190,14 @@ def model_solution(clicks, df_json):
 
     dff = pd.read_json(df_json, orient='records')
 
-    # get number of nodes from data
-    n_nodes = dff['location'].unique().count()
-
     # get the randomized nodes
     rnodes = dff['location'].tolist()
 
     # calculate shortest paths
-    paths = {i: {j: nx.shortest_path(mesh, i, j, weight='length') for j in nodelist} for i in nodelist}
+    paths = {
+        i: {j: nx.shortest_path(mesh, i, j, weight='length') for j in rnodes}
+        for i in rnodes
+    }
 
     def simplified_graph(graph, nodelist, pathlist):
         '''
@@ -204,63 +207,84 @@ def model_solution(clicks, df_json):
             '''
             Get total distance of a path in the network.
             '''
-            dist = round(sum(ox.utils_graph.get_route_edge_attributes(graph, path, 'length'))/1000., 2)
+            dist = round(sum(ox.utils_graph.get_route_edge_attributes(
+                graph, path, 'length'))/1000., 2)
             return dist
-        
-        distances = {i: {j: calc_distance(graph, pathlist[i][j]) for j in nodelist} for i in nodelist}
+
+        distances = {
+            i: {j: calc_distance(graph, pathlist[i][j]) for j in nodelist}
+            for i in nodelist
+        }
 
         # create simplified graph
         subgraph = nx.DiGraph()
-        
+
         # add nodes
         [subgraph.add_node(n) for n in nodelist]
 
         # add edges
-        [subgraph.add_edge(i, j, weight=distances[i][j]) for (i,j) in permutations(nodelist,2)]
-        
+        [subgraph.add_edge(i, j, weight=distances[i][j])
+         for (i, j) in permutations(nodelist, 2)]
+
         return subgraph
 
-    # get random nodes
-    rnodes = random.choices(mesh_nodes, k=n_nodes)
-    
     # create simplified graph
-    sgraph = simplified_graph(mesh, rnodes, paths)
+    sgraph = simplified_graph(mesh, nodelist=rnodes, pathlist=paths)
 
     # calculate excess supply/demand
-    exc_dem = df['net_demand'].sum()
+    exc_dem = dff['net_demand'].sum()
 
     # add dummy node
     sgraph.add_node('dummy')
     [sgraph.add_edge('dummy', n, length=0.1) for n in rnodes]
 
     # adding demand
-    [sgraph.add_node(n, demand=int(dftest[dftest['location']==n]['net_demand'])) for n in rnodes]
+    [sgraph.add_node(n, demand=int(dff[dff['location'] == n]['net_demand']))
+     for n in rnodes]
     sgraph.add_node('dummy', demand=-exc_dem)
 
     try:
-        _, flows = nx.network_simplex(sgraph)
+        cost, flows = nx.network_simplex(sgraph)
     except nx.NetworkXUnfeasible:
         return html.Div([
             dcc.Markdown('Solution not found.')
         ])
 
+    # filter nonzero flows
+    flows_nz = {
+        i: {j: flows[i][j] for j in flows[i].keys() if flows[i][j] > 0}
+        for i in flows.keys()
+    }
+
+    # filter empty items
+    flows_nz = {k: v for (k,v) in flows_nz.items() if v != {}}
+
+    # filter dummy flows
+    try:
+        flows_nz.pop('dummy', None)
+    except KeyError:
+        pass    
+
+    print(flows_nz)  # TODO: debug
+
     # nodes positions
     rnodes_attr = {n: mesh.nodes[n] for n in rnodes}
 
     # initialize figure
-    fig = ox.plot_route_folium(mesh, paths[rnodes[0]][rnodes[4]], popup_attribute='name', route_opacity=.7)
+    #fig = ox.plot_route_folium(mesh, paths[rnodes[0]][rnodes[0]], popup_attribute=None, route_opacity=0)
+    fig = ox.plot_graph_folium(mesh, edge_opacity=0)
 
     # add nodes
-    [ox.folium.folium.Marker([rnodes_attr[n]['y'], rnodes_attr[n]['x']], tooltip=str(n)).add_to(fig) for n in rnodes]
+    for n in rnodes:
+        ox.folium.folium.Marker([rnodes_attr[n]['y'], rnodes_attr[n]['x']], tooltip=str(n)).add_to(fig)
 
     # add routes
-    ox.plot_route_folium(mesh, paths[rnodes[0]][rnodes[3]], route_map=fig, popup_attribute='name', route_opacity=.7)
+    for orig in flows_nz.keys():
+        for dest in flows_nz[orig].keys():
+            ox.plot_route_folium(mesh, paths[orig][dest], route_map=fig, popup_attribute='name', route_opacity=.7)
 
-    # show figure
-    return html.Div([
-        dcc.Markdown('Ok!')
-    ])
-    
+    return html.Iframe(srcDoc=fig._repr_html_(), border=0)
+
 
 if __name__ == "__main__":
     app.run_server(debug=True)
