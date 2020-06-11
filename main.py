@@ -23,7 +23,7 @@ from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 from flask import Flask
 
-dash_app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SANDSTONE])
+dash_app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
 app = dash_app.server
 
 # generate map
@@ -44,9 +44,9 @@ navbar = dbc.Navbar([
         dbc.NavbarBrand('dash-inventory-flow', className='ml-2'),
         html.A([
             html.Img(
-                src='https://img.shields.io/github/forks/angelosalton/dash-inventory-flow?style=social', height='20px')
+                src='https://img.shields.io/github/stars/angelosalton/dash-inventory-flow', height='20px')
         ],
-            href='https://github.com/angelosalton/dash-inventory-flow/fork')
+            href='https://github.com/angelosalton/dash-inventory-flow/')
     ],
         align='center',
         no_gutters=True)
@@ -74,7 +74,7 @@ dash_app.layout = dbc.Container([
     # data stores
     dcc.Store(id='data-store', storage_type='session'),
     # top alert
-    dbc.Alert("Welcome!", color="success", fade=True),
+    dbc.Alert("Loading complete", color="primary", fade=True, duration=3000),
     # main
     dbc.Row([
         dcc.Markdown('''
@@ -91,39 +91,17 @@ dash_app.layout = dbc.Container([
             dcc.Loading([
                 dbc.Row([
                     dbc.Col([
-                        dcc.Markdown('#### Map'),
                         html.Div(id='plot-solution')
-                    ]),
+                    ], md=8),
                     dbc.Col([
                         dcc.Markdown('#### Data'),
                         html.Div(id='data-table')
-                    ])
+                    ], md=4)
                 ])
             ])
         ], md=10, style={'padding-left': '30px'})
     ])]
 )
-
-# Functions
-
-
-def fig_to_uri(in_fig: mpl.figure.Figure, close_all=True, **save_args) -> str:
-    '''
-    Generate .png from matplotlib figure.
-    '''
-    buffer = io.BytesIO()
-    in_fig.savefig(buffer, format='png', **save_args)
-
-    # close previous figures
-    # if close_all:
-    #     in_fig.clf()
-    # plt.close('all')
-
-    buffer.seek(0)  # rewind file
-    encoded = base64.b64encode(buffer.getbuffer()).decode(
-        "ascii").replace("\n", "")
-
-    return "data:image/png;base64,{}".format(encoded)
 
 
 # Callbacks
@@ -191,6 +169,7 @@ def model_solution(clicks, df_json):
     dff = pd.read_json(df_json, orient='records')
 
     # get the randomized nodes
+    # TODO: pretty names for nodes (e.g. 'A', 'B', 'C')
     rnodes = dff['location'].tolist()
 
     # calculate shortest paths
@@ -247,7 +226,7 @@ def model_solution(clicks, df_json):
         cost, flows = nx.network_simplex(sgraph)
     except nx.NetworkXUnfeasible:
         return html.Div([
-            dcc.Markdown('Solution not found.')
+            dcc.Markdown('## Solution not found.')
         ])
 
     # filter nonzero flows
@@ -257,33 +236,53 @@ def model_solution(clicks, df_json):
     }
 
     # filter empty items
-    flows_nz = {k: v for (k,v) in flows_nz.items() if v != {}}
+    flows_nz = {k: v for (k, v) in flows_nz.items() if v != {}}
 
     # filter dummy flows
     try:
         flows_nz.pop('dummy', None)
     except KeyError:
-        pass    
+        pass
 
     print(flows_nz)  # TODO: debug
+
+    # 1. Map --------------------------
 
     # nodes positions
     rnodes_attr = {n: mesh.nodes[n] for n in rnodes}
 
     # initialize figure
-    #fig = ox.plot_route_folium(mesh, paths[rnodes[0]][rnodes[0]], popup_attribute=None, route_opacity=0)
-    fig = ox.plot_graph_folium(mesh, edge_opacity=0)
+    fig = ox.plot_route_folium(mesh, paths[rnodes[0]][rnodes[1]], popup_attribute=None, route_opacity=0, width='600px', height='500px')
+    #fig = ox.plot_graph_folium(mesh, edge_opacity=0)
 
     # add nodes
     for n in rnodes:
-        ox.folium.folium.Marker([rnodes_attr[n]['y'], rnodes_attr[n]['x']], tooltip=str(n)).add_to(fig)
+        ox.folium.folium.Marker(
+            [rnodes_attr[n]['y'], rnodes_attr[n]['x']], tooltip=str(n)).add_to(fig)
 
     # add routes
     for orig in flows_nz.keys():
         for dest in flows_nz[orig].keys():
-            ox.plot_route_folium(mesh, paths[orig][dest], route_map=fig, popup_attribute='name', route_opacity=.7)
+            ox.plot_route_folium(
+                mesh, paths[orig][dest], route_map=fig, popup_attribute='name', route_opacity=.7)
 
-    return html.Iframe(srcDoc=fig._repr_html_(), border=0)
+    # 2. Print solutions --------------
+    transfers = f'Total cost: {str(round(cost, 2))}\n'
+
+    for orig in flows_nz.keys():
+        for dest in flows_nz[orig].keys():
+            transfers += f'Transfer {str(flows_nz[orig][dest])} from {orig} to {dest}\n'
+
+    print(transfers) # TODO: debug 
+
+    return dbc.Row([
+        dcc.Markdown('### Transfers'),
+        html.P(transfers),
+        dbc.Row([
+            dcc.Markdown('### Map'),
+            html.Iframe(srcDoc=fig._repr_html_())
+        ])
+    ])
 
 
 if __name__ == "__main__":
