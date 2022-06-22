@@ -35,7 +35,7 @@ matplotlib==3.2.1
 mccabe==0.6.1
 munch==2.5.0
 networkx==2.4
-numpy==1.18.4
+numpy==1.22.0
 osmnx==0.13.0
 pandas==1.0.3
 plotly==4.8.0
